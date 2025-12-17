@@ -1,0 +1,5 @@
+1765932257: mosquitto version 2.0.22 starting
+1765932257: Config loaded from /mosquitto/config/mosquitto.conf.
+1765932257: Opening ipv4 listen socket on port 1883.
+1765932257: Opening ipv6 listen socket on port 1883.
+1765932257: mosquitto version 2.0.22 running
