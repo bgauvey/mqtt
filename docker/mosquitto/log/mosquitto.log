@@ -3,3 +3,23 @@
 1765932257: Opening ipv4 listen socket on port 1883.
 1765932257: Opening ipv6 listen socket on port 1883.
 1765932257: mosquitto version 2.0.22 running
+1765935262: New connection from 192.168.97.1:32854 on port 1883.
+1765935262: New client connected from 192.168.97.1:32854 as SqlMqttBridge-Mac (p2, c1, k15).
+1765935269: Client SqlMqttBridge-Mac disconnected.
+1765935377: New connection from 192.168.97.1:49608 on port 1883.
+1765935377: New client connected from 192.168.97.1:49608 as SqlMqttBridge-Mac (p2, c1, k15).
+1765935417: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1765938976: New connection from 192.168.97.1:61856 on port 1883.
+1765938977: New client connected from 192.168.97.1:61856 as MT-e18a5570-56c7-40de (p2, c1, k30, u'admin').
+1765938978: New connection from 192.168.97.1:58067 on port 1883.
+1765938978: New client connected from 192.168.97.1:58067 as ME-d89b7cbc-bb45-4062 (p2, c1, k30, u'admin').
+1765939026: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1765940555: New connection from 192.168.97.1:60108 on port 1883.
+1765940555: Client <unknown> disconnected due to protocol error.
+1765940555: New connection from 192.168.97.1:60112 on port 1883.
+1765940555: Client <unknown> disconnected due to protocol error.
+1765940555: New connection from 192.168.97.1:60126 on port 1883.
+1765940555: Client <unknown> disconnected due to protocol error.
+1765940555: New connection from 192.168.97.1:60134 on port 1883.
+1765940555: Client <unknown> disconnected due to protocol error.
+1765940827: Saving in-memory database to /mosquitto/data//mosquitto.db.
