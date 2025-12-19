@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,6 +12,14 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json.Linq;
+using SparkplugNet.Core;
+using SparkplugNet.VersionB;
+using Google.Protobuf;
+using SparkplugMetric = SparkplugNet.VersionB.Data.Metric;
+using SparkplugPayload = SparkplugNet.VersionB.Data.Payload;
+using SparkplugDataType = SparkplugNet.VersionB.Data.DataType;
+using ProtoPayload = Org.Eclipse.Tahu.Protobuf.Payload;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddHostedService<MqttPublisherService>();
@@ -22,17 +31,29 @@ public class MqttPublisherService : BackgroundService
     private readonly ILogger<MqttPublisherService> _logger;
     private readonly string _connectionString;
     private readonly string _mqttBroker;
+    private readonly string _mqttUserName;
+    private readonly string _mqttPassword;
+    private readonly int _mqttPort = 1883;
+
     private IMqttClient? _mqttClient;
     private Func<CancellationToken, Task>? _connectAction;
 
     private readonly TimeSpan _pollDelay = TimeSpan.FromMilliseconds(500);
     private readonly Random _random = new();
+    private ulong _sequenceNumber = 0;
+    private readonly HashSet<string> _birthedDevices = new();
 
     public MqttPublisherService(ILogger<MqttPublisherService> logger, IConfiguration config)
     {
         _logger = logger;
         _connectionString = config.GetConnectionString("SqlServer")!;
         _mqttBroker = config["Mqtt:Broker"] ?? "localhost";
+        _mqttUserName = config["Mqtt:Username"] ?? string.Empty;
+        _mqttPassword = config["Mqtt:Password"] ?? string.Empty;
+        if (int.TryParse(config["Mqtt:Port"], out var port))
+        {
+            _mqttPort = port;
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -41,10 +62,10 @@ public class MqttPublisherService : BackgroundService
         var factory = new MqttFactory();
         _mqttClient = factory.CreateMqttClient();
 
-
         var options = new MqttClientOptionsBuilder()
-            .WithTcpServer(_mqttBroker, 1883)
+            .WithTcpServer(_mqttBroker, _mqttPort)
             .WithClientId($"SqlMqttBridge-{Environment.MachineName}")
+            .WithCredentials(_mqttUserName, _mqttPassword)
             .WithCleanSession()
             .Build();
 
@@ -53,6 +74,13 @@ public class MqttPublisherService : BackgroundService
 
         // Ensure connected before entering the poll loop
         await ReconnectWithBackoff(_connectAction, stoppingToken);
+
+        // Reset sequence number and publish NBIRTH (Node Birth) certificate first
+        _sequenceNumber = 0;
+        await PublishNodeBirthCertificate("BUL", "JobBridge", stoppingToken);
+
+        // Discover and publish DBIRTH for all devices in the outbox
+        await DiscoverAndPublishDeviceBirths("BUL", "JobBridge", stoppingToken);
 
         // Ensure disconnected handler also attempts reconnect using same connect action
         _mqttClient.DisconnectedAsync += async args =>
@@ -63,6 +91,11 @@ public class MqttPublisherService : BackgroundService
                 if (_connectAction != null)
                 {
                     await ReconnectWithBackoff(_connectAction, stoppingToken);
+                    // Reset sequence and republish birth certificates after reconnection
+                    _sequenceNumber = 0;
+                    _birthedDevices.Clear();
+                    await PublishNodeBirthCertificate("BUL", "JobBridge", stoppingToken);
+                    await DiscoverAndPublishDeviceBirths("BUL", "JobBridge", stoppingToken);
                 }
             }
             catch (OperationCanceledException)
@@ -180,9 +213,35 @@ public class MqttPublisherService : BackgroundService
                 // Publish each message
                 foreach (var (id, topic, payload) in messages)
                 {
+                    // Extract device name from topic and ensure DBIRTH was sent
+                    var deviceName = ExtractDeviceNameFromTopic(topic);
+                    if (!string.IsNullOrEmpty(deviceName) && !_birthedDevices.Contains(deviceName))
+                    {
+                        await PublishDeviceBirthCertificate("BUL", "JobBridge", deviceName, ct);
+                        _birthedDevices.Add(deviceName);
+                    }
+
+                    byte[] payloadBytes;
+
+                    try
+                    {
+                        // Convert JSON payload to Sparkplug B format
+                        var metrics = ConvertJsonToMetrics(payload);
+
+                        // Serialize to protobuf using Google.Protobuf with sequence number
+                        payloadBytes = SerializePayload(metrics, _sequenceNumber);
+                        _sequenceNumber++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to convert payload to Sparkplug B format for message {Id}", id);
+                        // Skip this message
+                        continue;
+                    }
+
                     var message = new MqttApplicationMessageBuilder()
                         .WithTopic(topic)
-                        .WithPayload(Encoding.UTF8.GetBytes(payload))
+                        .WithPayload(payloadBytes)
                         .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
                         .WithRetainFlag(false)
                         .Build();
@@ -190,7 +249,7 @@ public class MqttPublisherService : BackgroundService
                     try
                     {
                         await _mqttClient!.PublishAsync(message, ct);
-                        _logger.LogInformation("Published to {Topic}", topic);
+                        _logger.LogInformation("Published Sparkplug B message to {Topic}", topic);
                     }
                     catch (Exception ex)
                     {
@@ -229,6 +288,223 @@ public class MqttPublisherService : BackgroundService
                 continue;
             }
         }
+    }
+
+    private async Task DiscoverAndPublishDeviceBirths(string groupId, string edgeNodeId, CancellationToken ct)
+    {
+        try
+        {
+            // Query database to discover unique device names from topics
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(ct);
+
+            const string sql = @"
+                SELECT DISTINCT Topic
+                FROM dbo.MQTTOutbox
+                WHERE Topic LIKE 'spBv1.0/%/DDATA/%/%'";
+
+            var deviceNames = new HashSet<string>();
+
+            await using (var cmd = new SqlCommand(sql, connection))
+            {
+                cmd.CommandTimeout = 30;
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    var topic = reader.GetString(0);
+                    var deviceName = ExtractDeviceNameFromTopic(topic);
+                    if (!string.IsNullOrEmpty(deviceName))
+                    {
+                        deviceNames.Add(deviceName);
+                    }
+                }
+            }
+
+            // Publish DBIRTH for each unique device
+            foreach (var deviceName in deviceNames)
+            {
+                if (!_birthedDevices.Contains(deviceName))
+                {
+                    await PublishDeviceBirthCertificate(groupId, edgeNodeId, deviceName, ct);
+                    _birthedDevices.Add(deviceName);
+                }
+            }
+
+            _logger.LogInformation("Discovered and published DBIRTH for {Count} devices", deviceNames.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to discover and publish device births");
+        }
+    }
+
+    private static string? ExtractDeviceNameFromTopic(string topic)
+    {
+        // Expected format: spBv1.0/{group}/DDATA/{edgeNode}/{deviceName}
+        var parts = topic.Split('/');
+        if (parts.Length >= 5 && parts[2] == "DDATA")
+        {
+            return parts[4]; // Device name is the 5th part (index 4)
+        }
+        return null;
+    }
+
+    private async Task PublishNodeBirthCertificate(string groupId, string edgeNodeId, CancellationToken ct)
+    {
+        try
+        {
+            // Create NBIRTH (Node Birth) message - can be empty or contain node-level metrics
+            var metrics = new List<SparkplugMetric>();
+
+            var topic = $"spBv1.0/{groupId}/NBIRTH/{edgeNodeId}";
+
+            // Serialize to protobuf with current sequence number (should be 0 for NBIRTH)
+            var payloadBytes = SerializePayload(metrics, _sequenceNumber);
+            _sequenceNumber++;
+
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payloadBytes)
+                .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+                .WithRetainFlag(false)
+                .Build();
+
+            await _mqttClient!.PublishAsync(message, ct);
+            _logger.LogInformation("Published NBIRTH certificate to {Topic} with seq={Seq}", topic, _sequenceNumber - 1);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish NBIRTH certificate");
+        }
+    }
+
+    private async Task PublishDeviceBirthCertificate(string groupId, string edgeNodeId, string deviceId, CancellationToken ct)
+    {
+        try
+        {
+            // Create DBIRTH (Device Birth) message with metric definitions
+            var metrics = new List<SparkplugMetric>
+            {
+                new SparkplugMetric("woId", SparkplugDataType.String, "000000000"),
+                new SparkplugMetric("stateCd", SparkplugDataType.Int32, 0),
+                new SparkplugMetric("stateDesc", SparkplugDataType.String, "UNKNOWN"),
+                new SparkplugMetric("timestamp", SparkplugDataType.String, DateTime.UtcNow.ToString("MM/dd/yyyy HH:mm"))
+            };
+
+            var topic = $"spBv1.0/{groupId}/DBIRTH/{edgeNodeId}/{deviceId}";
+
+            // Serialize to protobuf with incremented sequence number
+            var payloadBytes = SerializePayload(metrics, _sequenceNumber);
+            _sequenceNumber++;
+
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payloadBytes)
+                .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+                .WithRetainFlag(false)
+                .Build();
+
+            await _mqttClient!.PublishAsync(message, ct);
+            _logger.LogInformation("Published DBIRTH certificate to {Topic} with seq={Seq}", topic, _sequenceNumber - 1);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish DBIRTH certificate");
+        }
+    }
+
+    private static byte[] SerializePayload(List<SparkplugMetric> metrics, ulong sequenceNumber)
+    {
+        // Create Sparkplug B protobuf payload
+        var protoPayload = new ProtoPayload
+        {
+            Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            Seq = sequenceNumber
+        };
+
+        // Convert metrics to protobuf format
+        foreach (var metric in metrics)
+        {
+            var protoMetric = new ProtoPayload.Types.Metric
+            {
+                Name = metric.Name,
+                Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Datatype = (uint)metric.DataType
+            };
+
+            // Set value based on data type
+            switch (metric.DataType)
+            {
+                case SparkplugDataType.Int32:
+                    protoMetric.IntValue = metric.Value != null ? Convert.ToUInt32(metric.Value) : 0;
+                    break;
+                case SparkplugDataType.String:
+                    protoMetric.StringValue = metric.Value?.ToString() ?? string.Empty;
+                    break;
+                case SparkplugDataType.Boolean:
+                    protoMetric.BooleanValue = metric.Value != null && Convert.ToBoolean(metric.Value);
+                    break;
+                case SparkplugDataType.Double:
+                    protoMetric.DoubleValue = metric.Value != null ? Convert.ToDouble(metric.Value) : 0.0;
+                    break;
+                case SparkplugDataType.Float:
+                    protoMetric.FloatValue = metric.Value != null ? Convert.ToSingle(metric.Value) : 0.0f;
+                    break;
+                default:
+                    protoMetric.StringValue = metric.Value?.ToString() ?? string.Empty;
+                    break;
+            }
+
+            protoPayload.Metrics.Add(protoMetric);
+        }
+
+        // Serialize using Google.Protobuf
+        return protoPayload.ToByteArray();
+    }
+
+    private static List<SparkplugMetric> ConvertJsonToMetrics(string jsonPayload)
+    {
+        var metrics = new List<SparkplugMetric>();
+        var json = JObject.Parse(jsonPayload);
+
+        foreach (var property in json.Properties())
+        {
+            SparkplugMetric metric;
+
+            // Determine data type and create metric
+            switch (property.Value.Type)
+            {
+                case JTokenType.Integer:
+                    metric = new SparkplugMetric(property.Name, SparkplugDataType.Int32, property.Value.Value<int>())
+                    {
+                        Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    };
+                    break;
+                case JTokenType.Float:
+                    metric = new SparkplugMetric(property.Name, SparkplugDataType.Double, property.Value.Value<double>())
+                    {
+                        Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    };
+                    break;
+                case JTokenType.Boolean:
+                    metric = new SparkplugMetric(property.Name, SparkplugDataType.Boolean, property.Value.Value<bool>())
+                    {
+                        Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    };
+                    break;
+                case JTokenType.String:
+                default:
+                    metric = new SparkplugMetric(property.Name, SparkplugDataType.String, property.Value.Value<string>() ?? string.Empty)
+                    {
+                        Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    };
+                    break;
+            }
+
+            metrics.Add(metric);
+        }
+
+        return metrics;
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
