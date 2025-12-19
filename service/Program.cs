@@ -42,6 +42,10 @@ public class MqttPublisherService : BackgroundService
     private readonly Random _random = new();
     private ulong _sequenceNumber = 0;
     private readonly HashSet<string> _birthedDevices = new();
+    private const string _groupId = "BUL";
+    private const string _edgeNodeId = "JobBridge";
+    private Guid _sessionId;
+    private DateTime _sessionStartTime;
 
     public MqttPublisherService(ILogger<MqttPublisherService> logger, IConfiguration config)
     {
@@ -58,6 +62,14 @@ public class MqttPublisherService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Create a new session ID for this connection
+        _sessionId = Guid.NewGuid();
+        _sessionStartTime = DateTime.UtcNow;
+        _logger.LogInformation("Starting new Sparkplug session with ID: {SessionId}", _sessionId);
+
+        // Ensure birth tracking table exists
+        await EnsureBirthTrackingTableExists(stoppingToken);
+
         // Setup MQTT Client
         var factory = new MqttFactory();
         _mqttClient = factory.CreateMqttClient();
@@ -77,10 +89,10 @@ public class MqttPublisherService : BackgroundService
 
         // Reset sequence number and publish NBIRTH (Node Birth) certificate first
         _sequenceNumber = 0;
-        await PublishNodeBirthCertificate("BUL", "JobBridge", stoppingToken);
+        await PublishNodeBirthCertificate("BUL", "JobExecBridge", stoppingToken);
 
         // Discover and publish DBIRTH for all devices in the outbox
-        await DiscoverAndPublishDeviceBirths("BUL", "JobBridge", stoppingToken);
+        await DiscoverAndPublishDeviceBirths("BUL", "JobExecBridge", _sessionId, stoppingToken);
 
         // Ensure disconnected handler also attempts reconnect using same connect action
         _mqttClient.DisconnectedAsync += async args =>
@@ -91,11 +103,25 @@ public class MqttPublisherService : BackgroundService
                 if (_connectAction != null)
                 {
                     await ReconnectWithBackoff(_connectAction, stoppingToken);
+
+                    // Create new session ID for reconnection
+                    var oldSessionId = _sessionId;
+                    _sessionId = Guid.NewGuid();
+                    _sessionStartTime = DateTime.UtcNow;
+                    _logger.LogInformation("Reconnected with new Sparkplug session ID: {SessionId}", _sessionId);
+
+                    // Clear old session's birth tracking
+                    await ClearBirthTrackingForSession(oldSessionId, stoppingToken);
+
+                    // Mark all unprocessed messages created before this session as processed
+                    // to prevent sending stale DDATA with invalid sequence numbers
+                    await MarkStaleMessagesAsProcessed(_sessionStartTime, stoppingToken);
+
                     // Reset sequence and republish birth certificates after reconnection
                     _sequenceNumber = 0;
                     _birthedDevices.Clear();
-                    await PublishNodeBirthCertificate("BUL", "JobBridge", stoppingToken);
-                    await DiscoverAndPublishDeviceBirths("BUL", "JobBridge", stoppingToken);
+                    await PublishNodeBirthCertificate("BUL", "JobExecBridge", stoppingToken);
+                    await DiscoverAndPublishDeviceBirths("BUL", "JobExecBridge", _sessionId, stoppingToken);
                 }
             }
             catch (OperationCanceledException)
@@ -217,8 +243,9 @@ public class MqttPublisherService : BackgroundService
                     var deviceName = ExtractDeviceNameFromTopic(topic);
                     if (!string.IsNullOrEmpty(deviceName) && !_birthedDevices.Contains(deviceName))
                     {
-                        await PublishDeviceBirthCertificate("BUL", "JobBridge", deviceName, ct);
+                        await PublishDeviceBirthCertificate("BUL", "JobExecBridge", deviceName, ct);
                         _birthedDevices.Add(deviceName);
+                        await RecordDeviceBirth(deviceName, _sessionId, ct);
                     }
 
                     byte[] payloadBytes;
@@ -290,7 +317,114 @@ public class MqttPublisherService : BackgroundService
         }
     }
 
-    private async Task DiscoverAndPublishDeviceBirths(string groupId, string edgeNodeId, CancellationToken ct)
+    private async Task EnsureBirthTrackingTableExists(CancellationToken ct)
+    {
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(ct);
+
+            const string createTableSql = @"
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'SparkplugBirthTracking')
+                BEGIN
+                    CREATE TABLE dbo.SparkplugBirthTracking (
+                        DeviceName NVARCHAR(255) PRIMARY KEY,
+                        LastBirthAt DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
+                        SessionId UNIQUEIDENTIFIER NOT NULL
+                    );
+                    CREATE INDEX IX_SparkplugBirthTracking_SessionId ON dbo.SparkplugBirthTracking(SessionId);
+                END";
+
+            await using var cmd = new SqlCommand(createTableSql, connection);
+            cmd.CommandTimeout = 30;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to ensure birth tracking table exists");
+        }
+    }
+
+    private async Task ClearBirthTrackingForSession(Guid sessionId, CancellationToken ct)
+    {
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(ct);
+
+            const string deleteSql = "DELETE FROM dbo.SparkplugBirthTracking WHERE SessionId = @SessionId";
+
+            await using var cmd = new SqlCommand(deleteSql, connection);
+            cmd.Parameters.Add("@SessionId", SqlDbType.UniqueIdentifier).Value = sessionId;
+            cmd.CommandTimeout = 30;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to clear birth tracking for session");
+        }
+    }
+
+    private async Task MarkStaleMessagesAsProcessed(DateTime sessionStartTime, CancellationToken ct)
+    {
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(ct);
+
+            const string updateSql = @"
+                UPDATE dbo.MQTTOutbox
+                SET IsProcessed = 1, ProcessedAt = GETUTCDATE()
+                WHERE IsProcessed = 0
+                AND CreatedAt < @SessionStartTime";
+
+            await using var cmd = new SqlCommand(updateSql, connection);
+            cmd.Parameters.Add("@SessionStartTime", SqlDbType.DateTime2).Value = sessionStartTime;
+            cmd.CommandTimeout = 30;
+
+            var rowsAffected = await cmd.ExecuteNonQueryAsync(ct);
+
+            if (rowsAffected > 0)
+            {
+                _logger.LogWarning("Marked {Count} stale messages as processed to prevent Sparkplug B protocol violations", rowsAffected);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to mark stale messages as processed");
+        }
+    }
+
+    private async Task RecordDeviceBirth(string deviceName, Guid sessionId, CancellationToken ct)
+    {
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(ct);
+
+            const string upsertSql = @"
+                MERGE dbo.SparkplugBirthTracking AS target
+                USING (SELECT @DeviceName AS DeviceName, @SessionId AS SessionId) AS source
+                ON target.DeviceName = source.DeviceName
+                WHEN MATCHED THEN
+                    UPDATE SET LastBirthAt = GETUTCDATE(), SessionId = @SessionId
+                WHEN NOT MATCHED THEN
+                    INSERT (DeviceName, SessionId, LastBirthAt)
+                    VALUES (@DeviceName, @SessionId, GETUTCDATE());";
+
+            await using var cmd = new SqlCommand(upsertSql, connection);
+            cmd.Parameters.Add("@DeviceName", SqlDbType.NVarChar, 255).Value = deviceName;
+            cmd.Parameters.Add("@SessionId", SqlDbType.UniqueIdentifier).Value = sessionId;
+            cmd.CommandTimeout = 30;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to record device birth in database");
+        }
+    }
+
+    private async Task DiscoverAndPublishDeviceBirths(string groupId, string edgeNodeId, Guid sessionId, CancellationToken ct)
     {
         try
         {
@@ -327,6 +461,7 @@ public class MqttPublisherService : BackgroundService
                 {
                     await PublishDeviceBirthCertificate(groupId, edgeNodeId, deviceName, ct);
                     _birthedDevices.Add(deviceName);
+                    await RecordDeviceBirth(deviceName, sessionId, ct);
                 }
             }
 
@@ -386,8 +521,9 @@ public class MqttPublisherService : BackgroundService
             var metrics = new List<SparkplugMetric>
             {
                 new SparkplugMetric("woId", SparkplugDataType.String, "000000000"),
-                new SparkplugMetric("stateCd", SparkplugDataType.Int32, 0),
-                new SparkplugMetric("stateDesc", SparkplugDataType.String, "UNKNOWN"),
+                new SparkplugMetric("operId", SparkplugDataType.String, "000000000"),
+                new SparkplugMetric("seqNo", SparkplugDataType.Int32, 0),
+                new SparkplugMetric("itemId", SparkplugDataType.String, "UNKNOWN"),
                 new SparkplugMetric("timestamp", SparkplugDataType.String, DateTime.UtcNow.ToString("MM/dd/yyyy HH:mm"))
             };
 
@@ -507,12 +643,40 @@ public class MqttPublisherService : BackgroundService
         return metrics;
     }
 
+    private async Task PublishNodeDeathCertificate(string groupId, string edgeNodeId, CancellationToken ct)
+    {
+        try
+        {
+            // Create NDEATH (Node Death) message
+            var topic = $"spBv1.0/{groupId}/NDEATH/{edgeNodeId}";
+
+            // NDEATH should have the next sequence number in the sequence
+            var payloadBytes = SerializePayload(new List<SparkplugMetric>(), _sequenceNumber);
+
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payloadBytes)
+                .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+                .WithRetainFlag(false)
+                .Build();
+
+            await _mqttClient!.PublishAsync(message, ct);
+            _logger.LogInformation("Published NDEATH certificate to {Topic} with seq={Seq}", topic, _sequenceNumber);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish NDEATH certificate");
+        }
+    }
+
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         try
         {
             if (_mqttClient?.IsConnected == true)
             {
+                // Publish NDEATH before disconnecting
+                await PublishNodeDeathCertificate(_groupId, _edgeNodeId, cancellationToken);
                 await _mqttClient.DisconnectAsync();
             }
         }
