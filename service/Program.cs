@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Data;
@@ -40,11 +38,11 @@ public class MqttPublisherService : BackgroundService
 
     private readonly TimeSpan _pollDelay = TimeSpan.FromMilliseconds(500);
     private readonly Random _random = new();
-    private readonly Dictionary<string, ulong> _sequenceNumbers = new();
+    private readonly Dictionary<string, byte> _sequenceNumbers = [];
     private readonly Dictionary<string, HashSet<string>> _birthedDevices = new();
     private readonly Dictionary<string, string> _nodeGroupMap = new(); // Maps nodeId to groupId
+    private readonly SemaphoreSlim _stateLock = new(1, 1); // Protects shared state dictionaries
     private Guid _sessionId;
-    private DateTime _sessionStartTime;
 
     public MqttPublisherService(ILogger<MqttPublisherService> logger, IConfiguration config)
     {
@@ -63,7 +61,6 @@ public class MqttPublisherService : BackgroundService
     {
         // Create a new session ID for this connection
         _sessionId = Guid.NewGuid();
-        _sessionStartTime = DateTime.UtcNow;
         _logger.LogInformation("Starting new Sparkplug session with ID: {SessionId}", _sessionId);
 
         // Ensure birth tracking table exists
@@ -73,15 +70,38 @@ public class MqttPublisherService : BackgroundService
         var factory = new MqttFactory();
         _mqttClient = factory.CreateMqttClient();
 
-        var options = new MqttClientOptionsBuilder()
+        // Discover the first node to set up Last Will and Testament
+        var (firstGroupId, firstNodeId) = await DiscoverFirstNode(stoppingToken);
+
+        var optionsBuilder = new MqttClientOptionsBuilder()
             .WithTcpServer(_mqttBroker, _mqttPort)
             .WithClientId($"SqlMqttBridge-{Environment.MachineName}")
             .WithCredentials(_mqttUserName, _mqttPassword)
-            .WithCleanSession()
-            .Build();
+            .WithCleanSession();
+
+        // Add Last Will and Testament (LWT) for NDEATH if we have a node
+        if (!string.IsNullOrEmpty(firstGroupId) && !string.IsNullOrEmpty(firstNodeId))
+        {
+            var ndeathTopic = $"spBv1.0/{firstGroupId}/NDEATH/{firstNodeId}";
+            var ndeathPayload = SerializePayload(new List<SparkplugMetric>(), 0);
+
+            optionsBuilder
+                .WithWillTopic(ndeathTopic)
+                .WithWillPayload(ndeathPayload)
+                .WithWillQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+                .WithWillRetain(false);
+
+            _logger.LogInformation("Configured MQTT Last Will and Testament for {Topic}", ndeathTopic);
+        }
+        else
+        {
+            _logger.LogWarning("No nodes found in database, skipping Last Will and Testament configuration");
+        }
+
+        var options = optionsBuilder.Build();
 
         // store a connect action that uses the built options (captured)
-        _connectAction = ct => _mqttClient!.ConnectAsync(options, ct);
+        _connectAction = ct => _mqttClient.ConnectAsync(options, ct);
 
         // Ensure connected before entering the poll loop
         await ReconnectWithBackoff(_connectAction, stoppingToken);
@@ -102,20 +122,30 @@ public class MqttPublisherService : BackgroundService
                     // Create new session ID for reconnection
                     var oldSessionId = _sessionId;
                     _sessionId = Guid.NewGuid();
-                    _sessionStartTime = DateTime.UtcNow;
+                    var reconnectTime = DateTime.UtcNow;
                     _logger.LogInformation("Reconnected with new Sparkplug session ID: {SessionId}", _sessionId);
 
                     // Clear old session's birth tracking
                     await ClearBirthTrackingForSession(oldSessionId, stoppingToken);
 
-                    // Mark all unprocessed messages created before this session as processed
-                    // to prevent sending stale DDATA with invalid sequence numbers
-                    await MarkStaleMessagesAsProcessed(_sessionStartTime, stoppingToken);
+                    // IMPORTANT: Do NOT mark messages as processed here!
+                    // Messages that arrived while we were disconnected need to be published.
+                    // Only the original session start time matters for marking truly stale messages
+                    // (messages that were in queue before the service first started).
 
                     // Reset sequence and republish birth certificates after reconnection
-                    _sequenceNumbers.Clear();
-                    _birthedDevices.Clear();
-                    _nodeGroupMap.Clear();
+                    await _stateLock.WaitAsync(stoppingToken);
+                    try
+                    {
+                        _sequenceNumbers.Clear();
+                        _birthedDevices.Clear();
+                        _nodeGroupMap.Clear();
+                    }
+                    finally
+                    {
+                        _stateLock.Release();
+                    }
+
                     await DiscoverAndPublishAllNodeBirths(_sessionId, stoppingToken);
                 }
             }
@@ -231,13 +261,14 @@ public class MqttPublisherService : BackgroundService
                     }
                 }
 
+                // Before processing any messages, ensure all nodes are birthed
+                await EnsureAllNodesAreBirthed(messages, ct);
+
                 // Publish each message
                 foreach (var (id, topic, payload) in messages)
                 {
                     // Extract group ID, node ID and device name from topic
-                    var groupId = ExtractGroupIdFromTopic(topic);
-                    var nodeId = ExtractNodeIdFromTopic(topic);
-                    var deviceName = ExtractDeviceNameFromTopic(topic);
+                    var (groupId, nodeId, deviceName) = ParseTopic(topic);
 
                     if (string.IsNullOrEmpty(groupId) || string.IsNullOrEmpty(nodeId))
                     {
@@ -245,17 +276,8 @@ public class MqttPublisherService : BackgroundService
                         continue;
                     }
 
-                    // Track the group for this node
-                    SetNodeGroup(nodeId, groupId);
-
-                    // Ensure DBIRTH was sent for this device on this node
-                    var birthedDevices = GetBirthedDevices(nodeId);
-                    if (!string.IsNullOrEmpty(deviceName) && !birthedDevices.Contains(deviceName))
-                    {
-                        await PublishDeviceBirthCertificate(groupId, nodeId, deviceName, ct);
-                        birthedDevices.Add(deviceName);
-                        await RecordDeviceBirth(deviceName, _sessionId, ct);
-                    }
+                    // Note: NBIRTH and DBIRTH certificates are already published by EnsureAllNodesAreBirthed
+                    // This ensures proper Sparkplug B ordering: NBIRTH -> DBIRTH -> DDATA
 
                     byte[] payloadBytes;
 
@@ -326,6 +348,93 @@ public class MqttPublisherService : BackgroundService
         }
     }
 
+    private async Task EnsureAllNodesAreBirthed(List<(long Id, string Topic, string Payload)> messages, CancellationToken ct)
+    {
+        // Group messages by node and collect all unique devices per node
+        var nodeInfo = new Dictionary<string, (string GroupId, HashSet<string> Devices)>();
+
+        foreach (var (_, topic, _) in messages)
+        {
+            var (groupId, nodeId, deviceName) = ParseTopic(topic);
+
+            if (string.IsNullOrEmpty(groupId) || string.IsNullOrEmpty(nodeId))
+                continue;
+
+            if (!nodeInfo.TryGetValue(nodeId, out var info))
+            {
+                info = (groupId, new HashSet<string>());
+                nodeInfo[nodeId] = info;
+            }
+
+            if (!string.IsNullOrEmpty(deviceName))
+            {
+                info.Devices.Add(deviceName);
+            }
+        }
+
+        // For each node, ensure NBIRTH is sent, then DBIRTH for all devices
+        foreach (var (nodeId, (groupId, devices)) in nodeInfo)
+        {
+            // Track the group for this node
+            SetNodeGroup(nodeId, groupId);
+
+            // Check if NBIRTH has been sent for this node
+            if (!HasNodeBeenBirthed(nodeId))
+            {
+                // Reset sequence and publish NBIRTH
+                ResetSequence(nodeId);
+                await PublishNodeBirthCertificate(groupId, nodeId, ct);
+                _logger.LogInformation("Published NBIRTH for node {NodeId} in group {GroupId}", nodeId, groupId);
+            }
+
+            // Ensure DBIRTH is sent for all devices on this node
+            var birthedDevices = GetBirthedDevices(nodeId);
+            foreach (var deviceName in devices)
+            {
+                if (!birthedDevices.Contains(deviceName))
+                {
+                    await PublishDeviceBirthCertificate(groupId, nodeId, deviceName, ct);
+                    birthedDevices.Add(deviceName);
+                    await RecordDeviceBirth(deviceName, _sessionId, ct);
+                    _logger.LogInformation("Published DBIRTH for device {DeviceName} on node {NodeId}", deviceName, nodeId);
+                }
+            }
+        }
+    }
+
+    private async Task<(string? GroupId, string? NodeId)> DiscoverFirstNode(CancellationToken ct)
+    {
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(ct);
+
+            // Query for any topic (regardless of IsProcessed) to discover a node for LWT
+            const string sql = @"
+                SELECT TOP 1 Topic
+                FROM dbo.MQTTOutbox
+                WHERE Topic LIKE 'spBv1.0/%/DDATA/%/%'";
+
+            await using var cmd = new SqlCommand(sql, connection);
+            cmd.CommandTimeout = 30;
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            if (await reader.ReadAsync(ct))
+            {
+                var topic = reader.GetString(0);
+                var (groupId, nodeId, _) = ParseTopic(topic);
+                return (groupId, nodeId);
+            }
+
+            return (null, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to discover first node for LWT configuration");
+            return (null, null);
+        }
+    }
+
     private async Task EnsureBirthTrackingTableExists(CancellationToken ct)
     {
         try
@@ -374,36 +483,6 @@ public class MqttPublisherService : BackgroundService
         }
     }
 
-    private async Task MarkStaleMessagesAsProcessed(DateTime sessionStartTime, CancellationToken ct)
-    {
-        try
-        {
-            await using var connection = new SqlConnection(_connectionString);
-            await connection.OpenAsync(ct);
-
-            const string updateSql = @"
-                UPDATE dbo.MQTTOutbox
-                SET IsProcessed = 1, ProcessedAt = GETUTCDATE()
-                WHERE COALESCE(IsProcessed, 0) = 0
-                AND CreatedAt < @SessionStartTime";
-
-            await using var cmd = new SqlCommand(updateSql, connection);
-            cmd.Parameters.Add("@SessionStartTime", SqlDbType.DateTime2).Value = sessionStartTime;
-            cmd.CommandTimeout = 30;
-
-            var rowsAffected = await cmd.ExecuteNonQueryAsync(ct);
-
-            if (rowsAffected > 0)
-            {
-                _logger.LogWarning("Marked {Count} stale messages as processed to prevent Sparkplug B protocol violations", rowsAffected);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to mark stale messages as processed");
-        }
-    }
-
     private async Task RecordDeviceBirth(string deviceName, Guid sessionId, CancellationToken ct)
     {
         try
@@ -441,11 +520,12 @@ public class MqttPublisherService : BackgroundService
             await using var connection = new SqlConnection(_connectionString);
             await connection.OpenAsync(ct);
 
+            // Query for ALL distinct topics (regardless of IsProcessed status) to discover nodes
+            // This ensures we publish birth certificates on startup even if all messages are processed
             const string sql = @"
                 SELECT DISTINCT Topic
                 FROM dbo.MQTTOutbox
-                WHERE Topic LIKE 'spBv1.0/%/DDATA/%/%'
-                AND COALESCE(IsProcessed, 0) = 0";
+                WHERE Topic LIKE 'spBv1.0/%/DDATA/%/%'";
 
             var nodeDeviceMap = new Dictionary<string, HashSet<string>>();
             var nodeGroupMap = new Dictionary<string, string>(); // Track groupId for each node
@@ -457,24 +537,29 @@ public class MqttPublisherService : BackgroundService
                 while (await reader.ReadAsync(ct))
                 {
                     var topic = reader.GetString(0);
-                    var groupId = ExtractGroupIdFromTopic(topic);
-                    var nodeId = ExtractNodeIdFromTopic(topic);
-                    var deviceName = ExtractDeviceNameFromTopic(topic);
+                    _logger.LogDebug("Found topic in database: {Topic}", topic);
+                    var (groupId, nodeId, deviceName) = ParseTopic(topic);
 
                     if (!string.IsNullOrEmpty(groupId) && !string.IsNullOrEmpty(nodeId))
                     {
                         // Track group for this node
                         nodeGroupMap[nodeId] = groupId;
 
-                        if (!nodeDeviceMap.ContainsKey(nodeId))
+                        if (!nodeDeviceMap.TryGetValue(nodeId, out var devices))
                         {
-                            nodeDeviceMap[nodeId] = new HashSet<string>();
+                            devices = [];
+                            nodeDeviceMap[nodeId] = devices;
                         }
 
                         if (!string.IsNullOrEmpty(deviceName))
                         {
                             nodeDeviceMap[nodeId].Add(deviceName);
                         }
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Topic {Topic} failed to parse: GroupId={GroupId}, NodeId={NodeId}, DeviceName={DeviceName}",
+                            topic, groupId ?? "null", nodeId ?? "null", deviceName ?? "null");
                     }
                 }
             }
@@ -515,70 +600,109 @@ public class MqttPublisherService : BackgroundService
         }
     }
 
-    private static string? ExtractDeviceNameFromTopic(string topic)
-    {
-        // Expected format: spBv1.0/{group}/DDATA/{edgeNode}/{deviceName}
-        var parts = topic.Split('/');
-        if (parts.Length >= 5 && parts[2] == "DDATA")
-        {
-            return parts[4]; // Device name is the 5th part (index 4)
-        }
-        return null;
-    }
-
-    private static string? ExtractNodeIdFromTopic(string topic)
+    private static (string? GroupId, string? NodeId, string? DeviceName) ParseTopic(string topic)
     {
         // Expected format: spBv1.0/{group}/DDATA/{edgeNode}/{deviceName}
         var parts = topic.Split('/');
         if (parts.Length >= 4 && parts[2] == "DDATA")
         {
-            return parts[3]; // Node ID is the 4th part (index 3)
+            return (
+                parts.Length >= 2 ? parts[1] : null,
+                parts[3],
+                parts.Length >= 5 ? parts[4] : null
+            );
         }
-        return null;
+        return (null, null, null);
     }
 
-    private static string? ExtractGroupIdFromTopic(string topic)
+    private byte GetAndIncrementSequence(string nodeId)
     {
-        // Expected format: spBv1.0/{group}/DDATA/{edgeNode}/{deviceName}
-        var parts = topic.Split('/');
-        if (parts.Length >= 2)
+        _stateLock.Wait();
+        try
         {
-            return parts[1]; // Group ID is the 2nd part (index 1)
+            if (!_sequenceNumbers.TryGetValue(nodeId, out var seq))
+            {
+                seq = 0;
+                _sequenceNumbers[nodeId] = seq;
+            }
+            var current = seq;
+            _sequenceNumbers[nodeId] = (byte)((seq + 1) % 256);
+            return current;
         }
-        return null;
-    }
-
-    private ulong GetAndIncrementSequence(string nodeId)
-    {
-        if (!_sequenceNumbers.ContainsKey(nodeId))
+        finally
         {
-            _sequenceNumbers[nodeId] = 0;
+            _stateLock.Release();
         }
-        return _sequenceNumbers[nodeId]++;
     }
 
     private void ResetSequence(string nodeId)
     {
-        _sequenceNumbers[nodeId] = 0;
+        _stateLock.Wait();
+        try
+        {
+            _sequenceNumbers[nodeId] = 0;
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+    }
+
+    private bool HasNodeBeenBirthed(string nodeId)
+    {
+        _stateLock.Wait();
+        try
+        {
+            return _sequenceNumbers.ContainsKey(nodeId);
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
     }
 
     private HashSet<string> GetBirthedDevices(string nodeId)
     {
-        if (!_birthedDevices.ContainsKey(nodeId))
+        _stateLock.Wait();
+        try
         {
-            _birthedDevices[nodeId] = new HashSet<string>();
+            if (!_birthedDevices.TryGetValue(nodeId, out var devices))
+            {
+                devices = [];
+                _birthedDevices[nodeId] = devices;
+            }
+            return devices;
         }
-        return _birthedDevices[nodeId];
+        finally
+        {
+            _stateLock.Release();
+        }
     }
 
     private void SetNodeGroup(string nodeId, string groupId)
     {
-        _nodeGroupMap[nodeId] = groupId;
+        _stateLock.Wait();
+        try
+        {
+            _nodeGroupMap[nodeId] = groupId;
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
     }
 
     private string? GetNodeGroup(string nodeId)
     {
-        return _nodeGroupMap.TryGetValue(nodeId, out var groupId) ? groupId : null;
+        _stateLock.Wait();
+        try
+        {
+            return _nodeGroupMap.TryGetValue(nodeId, out var groupId) ? groupId : null;
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
     }
 
     private async Task PublishNodeBirthCertificate(string groupId, string edgeNodeId, CancellationToken ct)
@@ -726,7 +850,7 @@ public class MqttPublisherService : BackgroundService
         return metrics;
     }
 
-    private static byte[] SerializePayload(List<SparkplugMetric> metrics, ulong sequenceNumber)
+    private static byte[] SerializePayload(List<SparkplugMetric> metrics, byte sequenceNumber)
     {
         // Create Sparkplug B protobuf payload
         var protoPayload = new ProtoPayload
@@ -854,7 +978,18 @@ public class MqttPublisherService : BackgroundService
             if (_mqttClient?.IsConnected == true)
             {
                 // Publish NDEATH for all active nodes before disconnecting
-                foreach (var nodeId in _sequenceNumbers.Keys)
+                List<string> nodeIds;
+                await _stateLock.WaitAsync(cancellationToken);
+                try
+                {
+                    nodeIds = [.. _sequenceNumbers.Keys];
+                }
+                finally
+                {
+                    _stateLock.Release();
+                }
+
+                foreach (var nodeId in nodeIds)
                 {
                     var groupId = GetNodeGroup(nodeId);
                     if (!string.IsNullOrEmpty(groupId))
