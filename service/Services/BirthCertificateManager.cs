@@ -71,11 +71,11 @@ public class BirthCertificateManager
                     }
                 }
 
-                _logger.LogInformation("Published NBIRTH and {DeviceCount} DBIRTH messages for node {NodeId} in group {GroupId}",
+                _logger.LogDebug("Published NBIRTH and {DeviceCount} DBIRTH messages for node {NodeId} in group {GroupId}",
                     deviceNames.Count, nodeId, groupId);
             }
 
-            _logger.LogInformation("Discovered and published births for {NodeCount} nodes", nodeDeviceMap.Count);
+            _logger.LogDebug("Discovered and published births for {NodeCount} nodes", nodeDeviceMap.Count);
         }
         catch (Exception ex)
         {
@@ -113,7 +113,7 @@ public class BirthCertificateManager
             {
                 _sequenceManager.ResetSequence(nodeId);
                 await PublishNodeBirthCertificateAsync(groupId, nodeId, ct);
-                _logger.LogInformation("Published NBIRTH for node {NodeId} in group {GroupId}", nodeId, groupId);
+                _logger.LogDebug("Published NBIRTH for node {NodeId} in group {GroupId}", nodeId, groupId);
             }
 
             var birthedDevices = GetBirthedDevices(nodeId);
@@ -123,7 +123,7 @@ public class BirthCertificateManager
                 {
                     await PublishDeviceBirthCertificateAsync(groupId, nodeId, deviceName, ct);
                     birthedDevices.Add(deviceName);
-                    _logger.LogInformation("Published DBIRTH for device {DeviceName} on node {NodeId}", deviceName, nodeId);
+                    _logger.LogDebug("Published DBIRTH for device {DeviceName} on node {NodeId}", deviceName, nodeId);
                 }
             }
         }
@@ -145,7 +145,7 @@ public class BirthCertificateManager
                 .Build();
 
             await _mqttClient.PublishAsync(message, ct);
-            _logger.LogInformation("Published NDEATH certificate to {Topic} with seq={Seq}", topic, seq);
+            _logger.LogDebug("Published NDEATH certificate to {Topic} with seq={Seq}", topic, seq);
         }
         catch (Exception ex)
         {
@@ -210,7 +210,7 @@ public class BirthCertificateManager
                 .Build();
 
             await _mqttClient.PublishAsync(message, ct);
-            _logger.LogInformation("Published NBIRTH certificate to {Topic} with seq={Seq}", topic, seq);
+            _logger.LogDebug("Published NBIRTH certificate to {Topic} with seq={Seq}", topic, seq);
         }
         catch (Exception ex)
         {
@@ -248,7 +248,7 @@ public class BirthCertificateManager
                 .Build();
 
             await _mqttClient.PublishAsync(message, ct);
-            _logger.LogInformation("Published DBIRTH certificate to {Topic} with seq={Seq} and {MetricCount} metrics",
+            _logger.LogDebug("Published DBIRTH certificate to {Topic} with seq={Seq} and {MetricCount} metrics",
                 birthTopic, seq, metrics.Count);
         }
         catch (Exception ex)

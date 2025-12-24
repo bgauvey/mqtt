@@ -96,7 +96,7 @@ public class OutboxProcessorService
                     try
                     {
                         await _mqttClient.PublishAsync(mqttMessage, ct);
-                        _logger.LogInformation("Published Sparkplug B message to {Topic}", message.Topic);
+                        _logger.LogDebug("Published Sparkplug B message to {Topic}", message.Topic);
                     }
                     catch (Exception ex)
                     {

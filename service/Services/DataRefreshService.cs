@@ -91,7 +91,7 @@ public class DataRefreshService
             }
 
             _lastRefresh = DateTime.UtcNow;
-            _logger.LogInformation("Completed data refresh for {TopicCount} topics", latestMessages.Count);
+            _logger.LogDebug("Completed data refresh for {TopicCount} topics", latestMessages.Count);
         }
         catch (Exception ex)
         {
@@ -104,7 +104,7 @@ public class DataRefreshService
         try
         {
             var latestMessages = await _repository.GetLatestMessagePerTopicAsync(ct);
-            _logger.LogInformation("Publishing latest state for {TopicCount} topics", latestMessages.Count);
+            _logger.LogDebug("Publishing latest state for {TopicCount} topics", latestMessages.Count);
 
             foreach (var (topic, payload) in latestMessages)
             {
@@ -138,7 +138,7 @@ public class DataRefreshService
                 }
             }
 
-            _logger.LogInformation("Completed publishing latest state for all topics");
+            _logger.LogDebug("Completed publishing latest state for all topics");
         }
         catch (Exception ex)
         {

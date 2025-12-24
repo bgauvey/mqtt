@@ -32,7 +32,7 @@ BEGIN
         LEFT JOIN dbo.util_reas ur ON i.cur_reas_cd = ur.reas_cd
         LEFT JOIN util_state us ON i.cur_state_cd = us.state_cd
         INNER JOIN dbo.ent e ON i.ent_id = e.ent_id
-        WHERE COALESCE(i.cur_log_id, 0) <> COALESCE( d.cur_log_id, 0);
+        WHERE COALESCE(i.cur_reas_cd, 0) <> COALESCE(d.cur_reas_cd, 0);
     END
 END;
 GO
