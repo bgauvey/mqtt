@@ -111,8 +111,8 @@ public class MqttPublisherService : BackgroundService
             {
                 try
                 {
-                    await _mqttClient.ReconnectAsync(stoppingToken);
-                    await HandleReconnectionAsync(stoppingToken);
+                    // Pass HandleReconnectionAsync to execute within the reconnection lock
+                    await _mqttClient.ReconnectAsync(stoppingToken, HandleReconnectionAsync);
                 }
                 catch (OperationCanceledException)
                 {

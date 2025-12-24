@@ -8,7 +8,7 @@ using MqttBridgeService.Configuration;
 
 namespace MqttBridgeService.Services;
 
-public class MqttClientManager
+public class MqttClientManager : IDisposable
 {
     private readonly ILogger<MqttClientManager> _logger;
     private readonly MqttSettings _settings;
@@ -16,9 +16,13 @@ public class MqttClientManager
     private readonly SemaphoreSlim _reconnectLock = new(1, 1);
     private IMqttClient? _mqttClient;
     private Func<CancellationToken, Task>? _connectAction;
+    private Func<MqttClientDisconnectedEventArgs, Task>? _disconnectedHandler;
+    private int _isReconnecting = 0;
+    private bool _disposed = false;
 
     public IMqttClient? Client => _mqttClient;
     public bool IsConnected => _mqttClient?.IsConnected ?? false;
+    public bool IsReconnecting => Interlocked.CompareExchange(ref _isReconnecting, 0, 0) == 1;
 
     public MqttClientManager(ILogger<MqttClientManager> logger, MqttSettings settings)
     {
@@ -59,10 +63,23 @@ public class MqttClientManager
             throw new InvalidOperationException("MqttClientManager must be initialized before connecting");
         }
 
-        await ReconnectWithBackoffAsync(_connectAction, ct);
+        if (!await _reconnectLock.WaitAsync(0, ct))
+        {
+            _logger.LogDebug("Connection already in progress, skipping duplicate attempt");
+            return;
+        }
+
+        try
+        {
+            await ReconnectWithBackoffAsync(_connectAction, ct);
+        }
+        finally
+        {
+            _reconnectLock.Release();
+        }
     }
 
-    public async Task ReconnectAsync(CancellationToken ct)
+    public async Task ReconnectAsync(CancellationToken ct, Func<CancellationToken, Task>? postReconnectAction = null)
     {
         if (_connectAction == null)
         {
@@ -78,10 +95,17 @@ public class MqttClientManager
 
         try
         {
+            Interlocked.Exchange(ref _isReconnecting, 1);
             await ReconnectWithBackoffAsync(_connectAction, ct);
+
+            if (postReconnectAction != null)
+            {
+                await postReconnectAction(ct);
+            }
         }
         finally
         {
+            Interlocked.Exchange(ref _isReconnecting, 0);
             _reconnectLock.Release();
         }
     }
@@ -90,7 +114,15 @@ public class MqttClientManager
     {
         if (_mqttClient != null)
         {
-            _mqttClient.DisconnectedAsync += handler;
+            // Remove old handler if exists
+            if (_disconnectedHandler != null)
+            {
+                _mqttClient.DisconnectedAsync -= _disconnectedHandler;
+            }
+
+            // Add new handler
+            _disconnectedHandler = handler;
+            _mqttClient.DisconnectedAsync += _disconnectedHandler;
         }
     }
 
@@ -128,6 +160,10 @@ public class MqttClientManager
 
                 await connectFunc(ct);
                 _logger.LogInformation("Connected to MQTT broker at {Broker}", _settings.Broker);
+
+                // Reset counters on successful connection
+                attempt = 0;
+                consecutiveFailures = 0;
                 return;
             }
             catch (OperationCanceledException)
@@ -136,10 +172,20 @@ public class MqttClientManager
             }
             catch (InvalidOperationException ex) when (ex.Message.Contains("connect/disconnect is pending"))
             {
-                _logger.LogDebug("Connection attempt already in progress, backing off");
                 attempt++;
+                consecutiveFailures++;
                 var backoffMs = Math.Min(1000 * (1 << attempt), 30_000) + _random.Next(0, 500);
-                await Task.Delay(backoffMs, ct);
+
+                _logger.LogDebug("Connection attempt already in progress, backing off");
+
+                try
+                {
+                    await Task.Delay(backoffMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
             }
             catch (Exception ex)
             {
@@ -158,10 +204,46 @@ public class MqttClientManager
                         attempt, backoffMs);
                 }
 
-                await Task.Delay(backoffMs, ct);
+                try
+                {
+                    await Task.Delay(backoffMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
             }
         }
 
         throw new OperationCanceledException(ct);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        try
+        {
+            if (_disconnectedHandler != null && _mqttClient != null)
+            {
+                _mqttClient.DisconnectedAsync -= _disconnectedHandler;
+            }
+
+            _mqttClient?.Dispose();
+            _reconnectLock.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error disposing MqttClientManager");
+        }
+        finally
+        {
+            _disposed = true;
+        }
+
+        GC.SuppressFinalize(this);
     }
 }
