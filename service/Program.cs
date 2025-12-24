@@ -102,15 +102,26 @@ public class MqttPublisherService : BackgroundService
         // Setup disconnection handler
         _mqttClient.SetDisconnectedHandler(async args =>
         {
-            _logger.LogWarning(args?.Exception, "MQTT client disconnected, attempting reconnect...");
-            try
+            if (args?.Exception != null && !stoppingToken.IsCancellationRequested)
             {
-                await _mqttClient.ReconnectAsync(stoppingToken);
-                await HandleReconnectionAsync(stoppingToken);
+                _logger.LogInformation("MQTT client disconnected: {Reason}", args.ReasonString ?? args.Exception.Message);
             }
-            catch (OperationCanceledException)
+
+            if (!stoppingToken.IsCancellationRequested)
             {
-                // Shutting down
+                try
+                {
+                    await _mqttClient.ReconnectAsync(stoppingToken);
+                    await HandleReconnectionAsync(stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Shutting down
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Reconnection handler failed");
+                }
             }
         });
 

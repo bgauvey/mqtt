@@ -13,6 +13,7 @@ public class MqttClientManager
     private readonly ILogger<MqttClientManager> _logger;
     private readonly MqttSettings _settings;
     private readonly Random _random = new();
+    private readonly SemaphoreSlim _reconnectLock = new(1, 1);
     private IMqttClient? _mqttClient;
     private Func<CancellationToken, Task>? _connectAction;
 
@@ -69,7 +70,20 @@ public class MqttClientManager
             return;
         }
 
-        await ReconnectWithBackoffAsync(_connectAction, ct);
+        if (!await _reconnectLock.WaitAsync(0, ct))
+        {
+            _logger.LogDebug("Reconnection already in progress, skipping duplicate attempt");
+            return;
+        }
+
+        try
+        {
+            await ReconnectWithBackoffAsync(_connectAction, ct);
+        }
+        finally
+        {
+            _reconnectLock.Release();
+        }
     }
 
     public void SetDisconnectedHandler(Func<MqttClientDisconnectedEventArgs, Task> handler)
@@ -101,6 +115,8 @@ public class MqttClientManager
     private async Task ReconnectWithBackoffAsync(Func<CancellationToken, Task> connectFunc, CancellationToken ct)
     {
         var attempt = 0;
+        var consecutiveFailures = 0;
+
         while (!ct.IsCancellationRequested)
         {
             try
@@ -114,19 +130,35 @@ public class MqttClientManager
                 _logger.LogInformation("Connected to MQTT broker at {Broker}", _settings.Broker);
                 return;
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("connect/disconnect is pending"))
+            {
+                _logger.LogDebug("Connection attempt already in progress, backing off");
+                attempt++;
+                var backoffMs = Math.Min(1000 * (1 << attempt), 30_000) + _random.Next(0, 500);
+                await Task.Delay(backoffMs, ct);
+            }
             catch (Exception ex)
             {
                 attempt++;
+                consecutiveFailures++;
                 var backoffMs = Math.Min(1000 * (1 << attempt), 30_000) + _random.Next(0, 500);
-                _logger.LogWarning(ex, "Failed to connect to MQTT broker, retrying in {Backoff}ms (attempt {Attempt})", backoffMs, attempt);
-                try
+
+                if (consecutiveFailures <= 3 || consecutiveFailures % 10 == 0)
                 {
-                    await Task.Delay(backoffMs, ct);
+                    _logger.LogWarning("Failed to connect to MQTT broker (attempt {Attempt}), retrying in {Backoff}ms: {Error}",
+                        attempt, backoffMs, ex.Message);
                 }
-                catch (OperationCanceledException)
+                else
                 {
-                    throw;
+                    _logger.LogDebug(ex, "Failed to connect to MQTT broker (attempt {Attempt}), retrying in {Backoff}ms",
+                        attempt, backoffMs);
                 }
+
+                await Task.Delay(backoffMs, ct);
             }
         }
 
