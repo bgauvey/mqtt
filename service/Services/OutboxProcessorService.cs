@@ -77,7 +77,7 @@ public class OutboxProcessorService
                     try
                     {
                         var metrics = _sparkplugService.ConvertJsonToMetrics(message.Payload);
-                        var seq = _sequenceManager.GetAndIncrementSequence(topicInfo.NodeId);
+                        var seq = await _sequenceManager.GetAndIncrementSequenceAsync(topicInfo.NodeId);
                         payloadBytes = _sparkplugService.SerializePayload(metrics, seq);
                     }
                     catch (Exception ex)

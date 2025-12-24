@@ -53,14 +53,14 @@ public class BirthCertificateManager
                     continue;
                 }
 
-                SetNodeGroup(nodeId, groupId);
+                await SetNodeGroupAsync(nodeId, groupId);
 
                 // Reset sequence and publish NBIRTH
-                _sequenceManager.ResetSequence(nodeId);
+                await _sequenceManager.ResetSequenceAsync(nodeId);
                 await PublishNodeBirthCertificateAsync(groupId, nodeId, ct);
 
                 // Publish DBIRTH for each device
-                var birthedDevices = GetBirthedDevices(nodeId);
+                var birthedDevices = await GetBirthedDevicesAsync(nodeId);
                 foreach (var deviceName in deviceNames)
                 {
                     if (!birthedDevices.Contains(deviceName))
@@ -107,16 +107,16 @@ public class BirthCertificateManager
 
         foreach (var (nodeId, (groupId, devices)) in nodeInfo)
         {
-            SetNodeGroup(nodeId, groupId);
+            await SetNodeGroupAsync(nodeId, groupId);
 
-            if (!HasNodeBeenBirthed(nodeId))
+            if (!await HasNodeBeenBirthedAsync(nodeId))
             {
-                _sequenceManager.ResetSequence(nodeId);
+                await _sequenceManager.ResetSequenceAsync(nodeId);
                 await PublishNodeBirthCertificateAsync(groupId, nodeId, ct);
                 _logger.LogDebug("Published NBIRTH for node {NodeId} in group {GroupId}", nodeId, groupId);
             }
 
-            var birthedDevices = GetBirthedDevices(nodeId);
+            var birthedDevices = await GetBirthedDevicesAsync(nodeId);
             foreach (var deviceName in devices)
             {
                 if (!birthedDevices.Contains(deviceName))
@@ -134,7 +134,7 @@ public class BirthCertificateManager
         try
         {
             var topic = $"spBv1.0/{groupId}/NDEATH/{nodeId}";
-            var seq = _sequenceManager.GetAndIncrementSequence(nodeId);
+            var seq = await _sequenceManager.GetAndIncrementSequenceAsync(nodeId);
             var payloadBytes = _sparkplugService.SerializePayload(new List<SparkplugMetric>(), seq);
 
             var message = new MqttApplicationMessageBuilder()
@@ -153,9 +153,9 @@ public class BirthCertificateManager
         }
     }
 
-    public void ClearBirthState()
+    public async Task ClearBirthStateAsync()
     {
-        _stateLock.Wait();
+        await _stateLock.WaitAsync();
         try
         {
             _birthedDevices.Clear();
@@ -167,9 +167,9 @@ public class BirthCertificateManager
         }
     }
 
-    public string? GetNodeGroup(string nodeId)
+    public async Task<string?> GetNodeGroupAsync(string nodeId)
     {
-        _stateLock.Wait();
+        await _stateLock.WaitAsync();
         try
         {
             return _nodeGroupMap.TryGetValue(nodeId, out var groupId) ? groupId : null;
@@ -180,9 +180,9 @@ public class BirthCertificateManager
         }
     }
 
-    public List<string> GetAllNodeIds()
+    public async Task<List<string>> GetAllNodeIdsAsync()
     {
-        _stateLock.Wait();
+        await _stateLock.WaitAsync();
         try
         {
             return _nodeGroupMap.Keys.ToList();
@@ -199,7 +199,7 @@ public class BirthCertificateManager
         {
             var metrics = new List<SparkplugMetric>();
             var topic = $"spBv1.0/{groupId}/NBIRTH/{nodeId}";
-            var seq = _sequenceManager.GetAndIncrementSequence(nodeId);
+            var seq = await _sequenceManager.GetAndIncrementSequenceAsync(nodeId);
             var payloadBytes = _sparkplugService.SerializePayload(metrics, seq);
 
             var message = new MqttApplicationMessageBuilder()
@@ -237,7 +237,7 @@ public class BirthCertificateManager
             }
 
             var birthTopic = $"spBv1.0/{groupId}/DBIRTH/{nodeId}/{deviceId}";
-            var seq = _sequenceManager.GetAndIncrementSequence(nodeId);
+            var seq = await _sequenceManager.GetAndIncrementSequenceAsync(nodeId);
             var payloadBytes = _sparkplugService.SerializePayload(metrics, seq);
 
             var message = new MqttApplicationMessageBuilder()
@@ -262,27 +262,26 @@ public class BirthCertificateManager
         var nodeDeviceMap = await _repository.GetAllNodeDeviceMappingsAsync(ct);
         if (nodeDeviceMap.TryGetValue(nodeId, out var devices) && devices.Any())
         {
-            var topic = $"spBv1.0/%/DDATA/{nodeId}/{devices.First()}";
             var allTopics = await _repository.GetLatestMessagePerTopicAsync(ct);
-            var matchingTopic = allTopics.FirstOrDefault(t => t.Topic.Contains($"/DDATA/{nodeId}/")).Topic;
+            var matchingEntry = allTopics.FirstOrDefault(t => t.Topic?.Contains($"/DDATA/{nodeId}/") == true);
 
-            if (!string.IsNullOrEmpty(matchingTopic))
+            if (!string.IsNullOrEmpty(matchingEntry.Topic))
             {
-                var topicInfo = _sparkplugService.ParseTopic(matchingTopic);
+                var topicInfo = _sparkplugService.ParseTopic(matchingEntry.Topic);
                 return topicInfo.GroupId;
             }
         }
         return null;
     }
 
-    private bool HasNodeBeenBirthed(string nodeId)
+    private async Task<bool> HasNodeBeenBirthedAsync(string nodeId)
     {
-        return _sequenceManager.HasSequence(nodeId);
+        return await _sequenceManager.HasSequenceAsync(nodeId);
     }
 
-    private HashSet<string> GetBirthedDevices(string nodeId)
+    private async Task<HashSet<string>> GetBirthedDevicesAsync(string nodeId)
     {
-        _stateLock.Wait();
+        await _stateLock.WaitAsync();
         try
         {
             if (!_birthedDevices.TryGetValue(nodeId, out var devices))
@@ -298,9 +297,9 @@ public class BirthCertificateManager
         }
     }
 
-    private void SetNodeGroup(string nodeId, string groupId)
+    private async Task SetNodeGroupAsync(string nodeId, string groupId)
     {
-        _stateLock.Wait();
+        await _stateLock.WaitAsync();
         try
         {
             _nodeGroupMap[nodeId] = groupId;

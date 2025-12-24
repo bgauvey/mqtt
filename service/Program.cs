@@ -15,6 +15,14 @@ var builder = Host.CreateApplicationBuilder(args);
 // Configure settings
 var mqttSettings = new MqttSettings();
 builder.Configuration.GetSection("Mqtt").Bind(mqttSettings);
+
+// Override password from environment variable if present for security
+var passwordFromEnv = builder.Configuration["MQTT_PASSWORD"] ?? Environment.GetEnvironmentVariable("MQTT_PASSWORD");
+if (!string.IsNullOrEmpty(passwordFromEnv))
+{
+    mqttSettings.Password = passwordFromEnv;
+}
+
 builder.Services.AddSingleton(mqttSettings);
 
 // Register services
@@ -170,8 +178,8 @@ public class MqttPublisherService : BackgroundService
 
         await _repository.ClearBirthTrackingForSessionAsync(oldSessionId, ct);
 
-        _sequenceManager.ClearAll();
-        _birthManager.ClearBirthState();
+        await _sequenceManager.ClearAllAsync();
+        await _birthManager.ClearBirthStateAsync();
 
         await _birthManager.DiscoverAndPublishAllNodeBirthsAsync(_sessionId, ct);
     }
@@ -182,10 +190,10 @@ public class MqttPublisherService : BackgroundService
         {
             if (_mqttClient.IsConnected)
             {
-                var nodeIds = _birthManager.GetAllNodeIds();
+                var nodeIds = await _birthManager.GetAllNodeIdsAsync();
                 foreach (var nodeId in nodeIds)
                 {
-                    var groupId = _birthManager.GetNodeGroup(nodeId);
+                    var groupId = await _birthManager.GetNodeGroupAsync(nodeId);
                     if (!string.IsNullOrEmpty(groupId))
                     {
                         await _birthManager.PublishNodeDeathCertificateAsync(groupId, nodeId, cancellationToken);

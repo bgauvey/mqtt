@@ -72,7 +72,7 @@ public class DataRefreshService
                 try
                 {
                     var metrics = _sparkplugService.ConvertJsonToMetrics(payload);
-                    var seq = _sequenceManager.GetAndIncrementSequence(topicInfo.NodeId);
+                    var seq = await _sequenceManager.GetAndIncrementSequenceAsync(topicInfo.NodeId);
                     var payloadBytes = _sparkplugService.SerializePayload(metrics, seq);
 
                     var message = new MqttApplicationMessageBuilder()
@@ -119,7 +119,7 @@ public class DataRefreshService
                 try
                 {
                     var metrics = _sparkplugService.ConvertJsonToMetrics(payload);
-                    var seq = _sequenceManager.GetAndIncrementSequence(topicInfo.NodeId);
+                    var seq = await _sequenceManager.GetAndIncrementSequenceAsync(topicInfo.NodeId);
                     var payloadBytes = _sparkplugService.SerializePayload(metrics, seq);
 
                     var message = new MqttApplicationMessageBuilder()

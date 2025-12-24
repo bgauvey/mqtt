@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace MqttBridgeService.Services;
 
@@ -9,9 +10,9 @@ public class SequenceManager
     private readonly Dictionary<string, byte> _sequenceNumbers = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
-    public byte GetAndIncrementSequence(string nodeId)
+    public async Task<byte> GetAndIncrementSequenceAsync(string nodeId)
     {
-        _lock.Wait();
+        await _lock.WaitAsync();
         try
         {
             if (!_sequenceNumbers.TryGetValue(nodeId, out var seq))
@@ -29,9 +30,9 @@ public class SequenceManager
         }
     }
 
-    public void ResetSequence(string nodeId)
+    public async Task ResetSequenceAsync(string nodeId)
     {
-        _lock.Wait();
+        await _lock.WaitAsync();
         try
         {
             _sequenceNumbers[nodeId] = 0;
@@ -42,9 +43,9 @@ public class SequenceManager
         }
     }
 
-    public bool HasSequence(string nodeId)
+    public async Task<bool> HasSequenceAsync(string nodeId)
     {
-        _lock.Wait();
+        await _lock.WaitAsync();
         try
         {
             return _sequenceNumbers.ContainsKey(nodeId);
@@ -55,9 +56,9 @@ public class SequenceManager
         }
     }
 
-    public void ClearAll()
+    public async Task ClearAllAsync()
     {
-        _lock.Wait();
+        await _lock.WaitAsync();
         try
         {
             _sequenceNumbers.Clear();
@@ -68,9 +69,9 @@ public class SequenceManager
         }
     }
 
-    public List<string> GetAllNodeIds()
+    public async Task<List<string>> GetAllNodeIdsAsync()
     {
-        _lock.Wait();
+        await _lock.WaitAsync();
         try
         {
             return _sequenceNumbers.Keys.ToList();

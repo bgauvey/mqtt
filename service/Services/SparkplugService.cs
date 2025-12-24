@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Google.Protobuf;
 using MqttBridgeService.Models;
 using Newtonsoft.Json.Linq;
@@ -13,18 +14,49 @@ public class SparkplugService
 {
     public TopicInfo ParseTopic(string topic)
     {
-        // Expected format: spBv1.0/{group}/DDATA/{edgeNode}/{deviceName}
-        var parts = topic.Split('/');
-        if (parts.Length >= 4 && parts[2] == "DDATA")
+        // Expected format: spBv1.0/{group}/{messageType}/{edgeNode}/{deviceName}
+        // Valid message types: NBIRTH, NDEATH, DBIRTH, DDEATH, NDATA, DDATA
+        if (string.IsNullOrWhiteSpace(topic))
         {
-            return new TopicInfo
-            {
-                GroupId = parts.Length >= 2 ? parts[1] : null,
-                NodeId = parts[3],
-                DeviceName = parts.Length >= 5 ? parts[4] : null
-            };
+            return new TopicInfo();
         }
-        return new TopicInfo();
+
+        var parts = topic.Split('/');
+
+        // Minimum required: spBv1.0/{group}/{messageType}/{edgeNode}
+        if (parts.Length < 4)
+        {
+            return new TopicInfo();
+        }
+
+        // Validate namespace (should be spBv1.0)
+        if (parts[0] != "spBv1.0")
+        {
+            return new TopicInfo();
+        }
+
+        var messageType = parts[2];
+        var validMessageTypes = new[] { "NBIRTH", "NDEATH", "DBIRTH", "DDEATH", "NDATA", "DDATA" };
+
+        if (!validMessageTypes.Contains(messageType))
+        {
+            return new TopicInfo();
+        }
+
+        var topicInfo = new TopicInfo
+        {
+            GroupId = parts[1],
+            NodeId = parts[3],
+            MessageType = messageType
+        };
+
+        // Device name is only present for D* messages (DBIRTH, DDEATH, DDATA)
+        if (messageType.StartsWith("D") && parts.Length >= 5)
+        {
+            topicInfo.DeviceName = parts[4];
+        }
+
+        return topicInfo;
     }
 
     public List<SparkplugMetric> ConvertJsonToMetrics(string jsonPayload)
@@ -133,7 +165,26 @@ public class SparkplugService
         switch (metric.DataType)
         {
             case SparkplugDataType.Int32:
-                protoMetric.IntValue = metric.Value != null ? Convert.ToUInt32(metric.Value) : 0;
+                if (metric.Value != null)
+                {
+                    try
+                    {
+                        var intValue = Convert.ToInt32(metric.Value);
+                        protoMetric.IntValue = intValue >= 0 ? (uint)intValue : 0;
+                    }
+                    catch (OverflowException)
+                    {
+                        protoMetric.IntValue = 0;
+                    }
+                    catch (FormatException)
+                    {
+                        protoMetric.IntValue = 0;
+                    }
+                }
+                else
+                {
+                    protoMetric.IntValue = 0;
+                }
                 break;
             case SparkplugDataType.String:
                 protoMetric.StringValue = metric.Value?.ToString() ?? string.Empty;
@@ -142,10 +193,46 @@ public class SparkplugService
                 protoMetric.BooleanValue = metric.Value != null && Convert.ToBoolean(metric.Value);
                 break;
             case SparkplugDataType.Double:
-                protoMetric.DoubleValue = metric.Value != null ? Convert.ToDouble(metric.Value) : 0.0;
+                if (metric.Value != null)
+                {
+                    try
+                    {
+                        protoMetric.DoubleValue = Convert.ToDouble(metric.Value);
+                    }
+                    catch (OverflowException)
+                    {
+                        protoMetric.DoubleValue = 0.0;
+                    }
+                    catch (FormatException)
+                    {
+                        protoMetric.DoubleValue = 0.0;
+                    }
+                }
+                else
+                {
+                    protoMetric.DoubleValue = 0.0;
+                }
                 break;
             case SparkplugDataType.Float:
-                protoMetric.FloatValue = metric.Value != null ? Convert.ToSingle(metric.Value) : 0.0f;
+                if (metric.Value != null)
+                {
+                    try
+                    {
+                        protoMetric.FloatValue = Convert.ToSingle(metric.Value);
+                    }
+                    catch (OverflowException)
+                    {
+                        protoMetric.FloatValue = 0.0f;
+                    }
+                    catch (FormatException)
+                    {
+                        protoMetric.FloatValue = 0.0f;
+                    }
+                }
+                else
+                {
+                    protoMetric.FloatValue = 0.0f;
+                }
                 break;
             default:
                 protoMetric.StringValue = metric.Value?.ToString() ?? string.Empty;
