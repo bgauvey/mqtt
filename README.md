@@ -113,20 +113,3 @@ I reviewed the code and found a few issues to be aware of:
 - The current **topic parsing** focuses on `DDATA` only; if you rely on other Sparkplug topics in code paths, expand parsing accordingly.
 
 If you hit any runtime exception, enable debug logs and check the topic and payload shape for malformed or unexpected payloads.
-
-## Contributing
-- Please open issues or PRs for bug fixes or feature requests.
-- Add unit tests for any behavior you change.
-- Run analyzers and linters before opening PRs. Adding `Microsoft.CodeAnalysis.NetAnalyzers` and a CI job to run `dotnet build` and `dotnet test` is recommended.
-
-### Suggested first PRs
-- Fix the `GetGroupIdForNodeAsync` NRE.
-- Convert Semaphore usage to async-friendly APIs and add concurrency tests for `SequenceManager`.
-- Add analyzers and a GitHub Actions workflow to run build/tests.
-
-## License
-This repository does not include a license file. If you plan to publish, add a `LICENSE` file (e.g., MIT) to clarify the project license.
-
----
-
-If you'd like, I can add a CI workflow, a CONTRIBUTING.md, or implement the high-priority fixes (NRE + Semaphore changes and tests).
